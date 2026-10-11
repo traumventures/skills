@@ -15,7 +15,7 @@ concurrency:
 
 jobs:
   python:
-    runs-on: [self-hosted, traumventures]
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
