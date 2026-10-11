@@ -1,0 +1,25 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    runs-on: [self-hosted, traumventures]
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile
+        run: python3 -m py_compile $(git ls-files '*.py')
+      - name: Evidence matrix template is valid
+        run: python3 skills/testing-strategy/scripts/validate_evidence_matrix.py skills/testing-strategy/assets/evidence-matrix.csv
