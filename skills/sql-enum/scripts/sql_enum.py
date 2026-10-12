@@ -13,6 +13,10 @@ The JSON Schema is the source of truth. A tagged union is a `oneOf` (or
       {"title": "Cash", "type": "object",
        "properties": {"variant": {"const": "cash"}}, "required": ["variant"]}]}
 
+Names: type and column `<enum>_variant`, field columns
+`<enum>_<variant>_<field>`, constraint `<enum>_variant_check`; a plain string
+`enum` field gets a type named after its title (`card_network`).
+
 Commands (SQL on stdout; --json for machine-readable output):
 
   show   SCHEMA                          variants, column names and SQL types
@@ -236,7 +240,7 @@ def column_type(doc, ps, where):
         tname = p.get("title") or name
         if not tname:
             fail(f"{where}: a string enum needs a \"title\" (or a $defs entry) to name its Postgres type")
-        typ = ident(snake(tname) + "_enum", "enum type")
+        typ = ident(snake(tname), "enum type")
         return typ, (typ, values)
     t = p.get("type")
     if isinstance(t, list):
@@ -295,7 +299,7 @@ class Enum:
         self.doc = doc
         self.node = node
         self.name = name
-        self.type = ident(f"{name}_enum", "enum type")
+        self.type = ident(f"{name}_variant", "variant type")
         self.disc = disc
         self.key = union_key(node)
         self.variants = variants
@@ -398,6 +402,8 @@ def field_enums(e):
             _, en = column_type(e.doc, f.schema, f"{v.label}.{f.key}")
             if en:
                 typ, labels = en
+                if typ == e.type:
+                    fail(f"field enum type `{typ}` has the same name as the variant type; retitle it")
                 if typ in found and found[typ] != labels:
                     fail(f"enum type `{typ}` is used with different values")
                 found[typ] = labels

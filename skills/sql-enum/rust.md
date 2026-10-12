@@ -1,8 +1,9 @@
 # Rust
 
-Two types per union, both named after it:
+Three types per union, all named after it:
 
 - **Native type** `PaymentMethod`: the Rust enum the application uses. With serde it serializes to exactly the JSON Schema shape.
+- **Variant type** `PaymentMethodVariant`: the fieldless enum mapped to the SQL type `payment_method_variant` (the values of the JSON `variant` property).
 - **Columnar type** `PaymentMethodSqlFields`: one field per SQL column, with the same names. It is a plain `sqlx::FromRow` struct.
 
 `From<PaymentMethod> for PaymentMethodSqlFields` is used for writing. `TryFrom<PaymentMethodSqlFields> for PaymentMethod` is used for reading; it only fails if the CHECK constraint is missing.
@@ -19,7 +20,7 @@ Two types per union, both named after it:
 | `string` / `integer` / `number` / `boolean` | `String` / `i64` / `f64` / `bool` |
 | `format`: `date-time`, `date`, `uuid` | `chrono::DateTime<Utc>` or `time::OffsetDateTime`, `NaiveDate`, `uuid::Uuid` |
 | `format`: `int32`, `int16`, `float` | `i32`, `i16`, `f32` |
-| String `enum` titled `CardNetwork` | Fieldless enum with `sqlx::Type`, `type_name = "card_network_enum"` |
+| String `enum` titled `CardNetwork` | Fieldless enum with `sqlx::Type`, `type_name = "card_network"` |
 | Union used as `Option<PaymentMethod>` | Table option `nullable`; the columnar type gets `Option<PaymentMethodVariant>` |
 
 Tuple variants (`Card(String)`) have no property names and do not work with `#[serde(tag = ..)]`, so always use named fields. A variant holding another data-carrying enum cannot be flattened; see SKILL.md.
@@ -40,12 +41,12 @@ pub enum PaymentMethod {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
 #[serde(rename_all = "snake_case")]
-#[sqlx(type_name = "card_network_enum", rename_all = "snake_case")]
+#[sqlx(type_name = "card_network", rename_all = "snake_case")]
 pub enum CardNetwork { Visa, Mastercard, Amex }
 
 // Columnar type: same names as the SQL columns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::Type)]
-#[sqlx(type_name = "payment_method_enum", rename_all = "snake_case")]
+#[sqlx(type_name = "payment_method_variant", rename_all = "snake_case")]
 pub enum PaymentMethodVariant { Card, BankTransfer, Cash }
 
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
@@ -145,7 +146,7 @@ sqlx::query!(
 )
 ```
 
-The variant column needs `PaymentMethodVariant`; binding a `String` to it fails with "column is of type payment_method_enum but expression is of type text".
+The variant column needs `PaymentMethodVariant`; binding a `String` to it fails with "column is of type payment_method_variant but expression is of type text".
 
 ## After `modify`
 

@@ -1,6 +1,6 @@
 ---
 name: sql-enum
-description: Store tagged unions (JSON Schema oneOf with a const discriminator; Rust enums with data) in Postgres as flat columns with a native ENUM `*_enum` type, a `*_variant` column, per-variant field columns and a CHECK constraint enforcing each variant's shape. Use when creating, migrating or querying such columns, e.g. "store this payment method union in Postgres" or "add a variant to payment_method".
+description: Store tagged unions (JSON Schema oneOf with a const discriminator; Rust enums with data) in Postgres as flat columns with a native ENUM type and column both named `*_variant`, per-variant field columns and a CHECK constraint enforcing each variant's shape. Use when creating, migrating or querying such columns, e.g. "store this payment method union in Postgres" or "add a variant to payment_method".
 ---
 
 # SQL Enum
@@ -26,14 +26,14 @@ The source of truth is a JSON Schema **tagged union**: a `oneOf` whose object br
 ```
 
 ```sql
-CREATE TYPE card_network_enum AS ENUM ('visa', 'mastercard', 'amex');
-CREATE TYPE payment_method_enum AS ENUM ('card', 'bank_transfer', 'cash');
+CREATE TYPE card_network AS ENUM ('visa', 'mastercard', 'amex');
+CREATE TYPE payment_method_variant AS ENUM ('card', 'bank_transfer', 'cash');
 
 CREATE TABLE payment (
     id bigint PRIMARY KEY,
-    payment_method_variant payment_method_enum NOT NULL,
+    payment_method_variant payment_method_variant NOT NULL,
     payment_method_card_last4 text,
-    payment_method_card_network card_network_enum,
+    payment_method_card_network card_network,
     payment_method_bank_transfer_iban text,
     payment_method_bank_transfer_bic text,
     CONSTRAINT payment_method_variant_check CHECK (
@@ -52,20 +52,20 @@ CREATE TABLE payment (
 | JSON Schema | Postgres |
 | --- | --- |
 | Union `title` `PaymentMethod` | Enum name `payment_method` (snake_case); override with `--name` |
-| Discriminator `const` values | Labels of `payment_method_enum`, in branch order |
-| Discriminator property (any name, `variant` recommended) | Column `payment_method_variant`, `NOT NULL` |
+| Discriminator `const` values | Labels of the native type `payment_method_variant`, in branch order |
+| Discriminator property `variant` (other names work) | Column `payment_method_variant` of that type, `NOT NULL` |
 | Branch property `last4` of `card` | Column `payment_method_card_last4`, always nullable at column level |
 | Property in `required` and not allowing `null` | `IS NOT NULL` inside its own variant |
 | Property not required, or `"type": [.., "null"]` | Unconstrained inside its own variant |
 | `string`, `integer`, `number`, `boolean` | `text`, `bigint`, `double precision`, `boolean` |
 | `format`: `date-time`, `date`, `time`, `uuid`, `duration`, `ipv4`/`ipv6` | `timestamptz`, `date`, `time`, `uuid`, `interval`, `inet` |
 | `format`: `int16`/`int32`/`int64`, `float`/`double`; `contentEncoding: base64` | `smallint`/`integer`/`bigint`, `real`/`double precision`; `bytea` |
-| String `enum` with a `title` (or a `$defs` name) | Its own native type `<title>_enum` |
+| String `enum` with a `title` (or a `$defs` name) | Its own native type `<title>` (e.g. `card_network`) |
 | `array` of a scalar | `<type>[]` |
 | `"x-sql": "bigint REFERENCES device(id)"` on a property | Column type verbatim; a nullable FK works as a variant-only FK |
 | Union used as an optional value (`Option<PaymentMethod>`) | Table option `nullable`: discriminator column without `NOT NULL` |
 
-**Naming:** everything is named after the enum: type `<enum>_enum`, columns `<enum>_variant` and `<enum>_<variant>_<field>`, constraint `<enum>_variant_check`. Never shorten it for the columns: for `method_*` columns, name the union `Method`. The only exception is when one table stores the same enum twice. Then each copy gets a role prefix ending in the enum name (`refund_payment_method_*`, via `--table 'refund,prefix=refund_payment_method'`). The type stays shared.
+**Naming:** everything is named after the enum, and the discriminator is called *variant* everywhere: JSON property `variant`, SQL type and column `<enum>_variant` (Postgres keeps type and column names apart, so sharing the name is fine), Rust `PaymentMethodVariant`. Field columns are `<enum>_<variant>_<field>`, constraint `<enum>_variant_check`. Never shorten it for the columns: for `method_*` columns, name the union `Method`. The only exception is when one table stores the same enum twice. Then each copy gets a role prefix ending in the enum name (`refund_payment_method_*`, via `--table 'refund,prefix=refund_payment_method'`). The type stays `payment_method_variant`.
 
 **The constraint**, per variant: other variants' fields `IS NULL`, own required fields `IS NOT NULL`, `ELSE false` at the end. `ELSE false` matters because a CHECK passes on NULL: a label added later is rejected until the constraint describes its shape. The native enum already rejects unknown labels.
 
