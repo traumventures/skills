@@ -5,8 +5,9 @@ Spec (JSON file or stdin):
 
     {
       "table": "payment",
-      "column": "method",
-      "enum_type": "payment_method_variant",   # optional, default <column>_variant
+      "enum": "payment_method",                 # snake_case Rust enum name
+      "prefix": "refund_payment_method",        # optional, default = enum; only when one
+                                                # table stores the same enum twice
       "nullable": false,                        # optional: Option<Enum> column
       "variants": {
         "card":          {"last4": "text", "network": "text"},
@@ -14,6 +15,9 @@ Spec (JSON file or stdin):
         "cash":          {}
       }
     }
+
+Names: type `<enum>_enum`, columns `<prefix>_variant` and
+`<prefix>_<variant>_<field>`, constraint `<prefix>_variant_check`.
 
 Variant names are the Postgres enum labels (snake_case). A trailing `?` on a
 field type makes the field optional inside its own variant. Field types are
@@ -48,8 +52,11 @@ def ident(name, what):
 
 def load(spec):
     table = ident(spec["table"], "table")
-    column = ident(spec["column"], "column")
-    enum_type = ident(spec.get("enum_type") or f"{column}_variant", "enum type")
+    if "enum" not in spec:
+        fail("`enum` (the snake_case Rust enum name, e.g. payment_method) is required")
+    enum = ident(spec["enum"], "enum")
+    prefix = ident(spec.get("prefix") or enum, "prefix")
+    enum_type = ident(f"{enum}_enum", "enum type")
     variants = spec.get("variants")
     if not variants:
         fail("`variants` must be a non-empty object")
@@ -60,16 +67,15 @@ def load(spec):
             ident(field, "field")
             optional = ty.rstrip().endswith("?")
             ty = ty.rstrip().rstrip("?").strip()
-            fields.append((variant, field, ident(f"{column}_{variant}_{field}", "column"), ty, optional))
+            fields.append((variant, field, ident(f"{prefix}_{variant}_{field}", "column"), ty, optional))
     names = [f[2] for f in fields]
     if len(names) != len(set(names)):
         fail("two variant fields map to the same column name")
     return {
         "table": table,
-        "column": column,
-        "variant_column": ident(f"{column}_variant", "column"),
+        "variant_column": ident(f"{prefix}_variant", "column"),
         "enum_type": enum_type,
-        "constraint": ident(f"{table}_{column}_variant_check", "constraint"),
+        "constraint": ident(f"{prefix}_variant_check", "constraint"),
         "nullable": bool(spec.get("nullable", False)),
         "variants": list(variants),
         "fields": fields,
@@ -82,7 +88,10 @@ def quote(label):
 
 def create_type(s):
     labels = ", ".join(quote(v) for v in s["variants"])
-    return f"CREATE TYPE {s['enum_type']} AS ENUM ({labels});"
+    return (
+        f"-- Once per enum; skip if another table already created it.\n"
+        f"CREATE TYPE {s['enum_type']} AS ENUM ({labels});"
+    )
 
 
 def column_defs(s):

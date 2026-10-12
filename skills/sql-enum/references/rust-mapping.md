@@ -8,7 +8,7 @@ Mirror the native enum with a fieldless Rust enum, and keep the data-carrying en
 
 ```rust
 #[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::Type)]
-#[sqlx(type_name = "payment_method_variant", rename_all = "snake_case")]
+#[sqlx(type_name = "payment_method_enum", rename_all = "snake_case")]
 pub enum PaymentMethodVariant { Card, BankTransfer, Cash }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -30,11 +30,11 @@ absent or wrong, so return an error instead of panicking:
 ```rust
 #[derive(Debug, sqlx::FromRow)]
 pub struct PaymentMethodColumns {
-    method_variant: PaymentMethodVariant,
-    method_card_last4: Option<String>,
-    method_card_network: Option<String>,
-    method_bank_transfer_iban: Option<String>,
-    method_bank_transfer_bic: Option<String>,
+    payment_method_variant: PaymentMethodVariant,
+    payment_method_card_last4: Option<String>,
+    payment_method_card_network: Option<String>,
+    payment_method_bank_transfer_iban: Option<String>,
+    payment_method_bank_transfer_bic: Option<String>,
 }
 
 fn required<T>(v: Option<T>, column: &str) -> Result<T, sqlx::Error> {
@@ -44,14 +44,14 @@ fn required<T>(v: Option<T>, column: &str) -> Result<T, sqlx::Error> {
 impl TryFrom<PaymentMethodColumns> for PaymentMethod {
     type Error = sqlx::Error;
     fn try_from(c: PaymentMethodColumns) -> Result<Self, sqlx::Error> {
-        Ok(match c.method_variant {
+        Ok(match c.payment_method_variant {
             PaymentMethodVariant::Card => PaymentMethod::Card {
-                last4: required(c.method_card_last4, "method_card_last4")?,
-                network: required(c.method_card_network, "method_card_network")?,
+                last4: required(c.payment_method_card_last4, "payment_method_card_last4")?,
+                network: required(c.payment_method_card_network, "payment_method_card_network")?,
             },
             PaymentMethodVariant::BankTransfer => PaymentMethod::BankTransfer {
-                iban: required(c.method_bank_transfer_iban, "method_bank_transfer_iban")?,
-                bic: c.method_bank_transfer_bic,
+                iban: required(c.payment_method_bank_transfer_iban, "payment_method_bank_transfer_iban")?,
+                bic: c.payment_method_bank_transfer_bic,
             },
             PaymentMethodVariant::Cash => PaymentMethod::Cash,
         })
@@ -69,7 +69,7 @@ Embed the columns in a row struct with `#[sqlx(flatten)]` and `query_as`:
 struct PaymentRow {
     id: i64,
     #[sqlx(flatten)]
-    method: PaymentMethodColumns,
+    payment_method: PaymentMethodColumns,
 }
 
 let rows: Vec<PaymentRow> = sqlx::query_as("SELECT * FROM payment").fetch_all(&pool).await?;
@@ -80,8 +80,8 @@ non-null override:
 
 ```rust
 sqlx::query!(
-    r#"SELECT id, method_variant AS "variant: PaymentMethodVariant", method_card_last4 AS "last4!"
-       FROM payment WHERE method_variant = 'card'"#
+    r#"SELECT id, payment_method_variant AS "variant: PaymentMethodVariant", payment_method_card_last4 AS "last4!"
+       FROM payment WHERE payment_method_variant = 'card'"#
 )
 ```
 
@@ -110,10 +110,10 @@ impl PaymentMethod {
     }
 }
 
-let (variant, last4, network, iban, bic) = method.columns();
+let (variant, last4, network, iban, bic) = payment_method.columns();
 sqlx::query!(
-    "INSERT INTO payment (id, method_variant, method_card_last4, method_card_network,
-                          method_bank_transfer_iban, method_bank_transfer_bic)
+    "INSERT INTO payment (id, payment_method_variant, payment_method_card_last4, payment_method_card_network,
+                          payment_method_bank_transfer_iban, payment_method_bank_transfer_bic)
      VALUES ($1, $2, $3, $4, $5, $6)",
     id, variant as PaymentMethodVariant, last4, network, iban, bic
 )
