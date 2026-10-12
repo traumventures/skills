@@ -1,30 +1,39 @@
 ---
 name: sql-enum
-description: Model Rust-style enums (sum types whose variants carry fields) in Postgres as flat columns, with a native Postgres ENUM `*_enum` type as the `*_variant` discriminator column, per-variant field columns, and a CHECK constraint that enforces each variant's shape. Use when designing, migrating, querying, or mapping such columns to Rust, e.g. "store this Rust enum in Postgres" or "add a variant to the payment method column".
+description: Store tagged unions (JSON Schema oneOf with a const discriminator; Rust enums with data) in Postgres as flat columns with a native ENUM `*_enum` type, a `*_variant` column, per-variant field columns and a CHECK constraint enforcing each variant's shape. Use when creating, migrating or querying such columns, e.g. "store this payment method union in Postgres" or "add a variant to payment_method".
 ---
 
 # SQL Enum
 
-Store a Rust enum like
+The source of truth is a JSON Schema **tagged union**: a `oneOf` whose object branches share a discriminator property with one `const` string per branch. Postgres stores it flat, and constraints keep it valid for every writer. For the Rust side, read [rust.md](rust.md).
 
-```rust
-enum PaymentMethod {
-    Card { last4: String, network: String },
-    BankTransfer { iban: String, bic: Option<String> },
-    Cash,
+```json
+{
+  "title": "PaymentMethod",
+  "oneOf": [
+    {"title": "Card", "type": "object",
+     "properties": {"variant": {"const": "card"}, "last4": {"type": "string"},
+                    "network": {"title": "CardNetwork", "enum": ["visa", "mastercard", "amex"]}},
+     "required": ["variant", "last4", "network"]},
+    {"title": "BankTransfer", "type": "object",
+     "properties": {"variant": {"const": "bank_transfer"}, "iban": {"type": "string"},
+                    "bic": {"type": ["string", "null"]}},
+     "required": ["variant", "iban"]},
+    {"title": "Cash", "type": "object",
+     "properties": {"variant": {"const": "cash"}}, "required": ["variant"]}
+  ]
 }
 ```
 
-as flat columns that the database itself keeps valid:
-
 ```sql
+CREATE TYPE card_network_enum AS ENUM ('visa', 'mastercard', 'amex');
 CREATE TYPE payment_method_enum AS ENUM ('card', 'bank_transfer', 'cash');
 
 CREATE TABLE payment (
     id bigint PRIMARY KEY,
     payment_method_variant payment_method_enum NOT NULL,
     payment_method_card_last4 text,
-    payment_method_card_network text,
+    payment_method_card_network card_network_enum,
     payment_method_bank_transfer_iban text,
     payment_method_bank_transfer_bic text,
     CONSTRAINT payment_method_variant_check CHECK (
@@ -38,58 +47,78 @@ CREATE TABLE payment (
 );
 ```
 
-## Convention
+## Mapping
 
-Every database name of an enum starts with one name: the snake_case Rust enum name (`PaymentMethod` -> `payment_method`). Do not shorten it for the columns (no `payment_method_enum` type with `method_*` columns): if short columns are wanted, the enum itself should be named `Method`. The Rust struct field matches too (`payment_method: PaymentMethod`), so `sqlx::FromRow` names line up.
+| JSON Schema | Postgres |
+| --- | --- |
+| Union `title` `PaymentMethod` | Enum name `payment_method` (snake_case); override with `--name` |
+| Discriminator `const` values | Labels of `payment_method_enum`, in branch order |
+| Discriminator property (any name, `variant` recommended) | Column `payment_method_variant`, `NOT NULL` |
+| Branch property `last4` of `card` | Column `payment_method_card_last4`, always nullable at column level |
+| Property in `required` and not allowing `null` | `IS NOT NULL` inside its own variant |
+| Property not required, or `"type": [.., "null"]` | Unconstrained inside its own variant |
+| `string`, `integer`, `number`, `boolean` | `text`, `bigint`, `double precision`, `boolean` |
+| `format`: `date-time`, `date`, `time`, `uuid`, `duration`, `ipv4`/`ipv6` | `timestamptz`, `date`, `time`, `uuid`, `interval`, `inet` |
+| `format`: `int16`/`int32`/`int64`, `float`/`double`; `contentEncoding: base64` | `smallint`/`integer`/`bigint`, `real`/`double precision`; `bytea` |
+| String `enum` with a `title` (or a `$defs` name) | Its own native type `<title>_enum` |
+| `array` of a scalar | `<type>[]` |
+| `"x-sql": "bigint REFERENCES device(id)"` on a property | Column type verbatim; a nullable FK works as a variant-only FK |
+| Union used as an optional value (`Option<PaymentMethod>`) | Table option `nullable`: discriminator column without `NOT NULL` |
 
-| Part | Name | Notes |
-| --- | --- | --- |
-| Type | `<enum>_enum` (e.g. `payment_method_enum`) | Native `CREATE TYPE .. AS ENUM`. Labels are the snake_case variant names, in declaration order. Created once and shared by every table that stores the enum. The `_enum` suffix keeps it distinct from the `_variant` column. |
-| Discriminator column | `<enum>_variant` | `NOT NULL`, unless the Rust field is `Option<Enum>`. Never call it `tag`, `kind` or `type`. |
-| Field column | `<enum>_<variant>_<field>` (e.g. `payment_method_card_last4`) | Always nullable at column level, because it is NULL for the other variants. Unit variants have no columns. |
-| Constraint | `<enum>_variant_check` | Single `CASE` over the discriminator, ending in `ELSE false`. |
+**Naming:** everything is named after the enum: type `<enum>_enum`, columns `<enum>_variant` and `<enum>_<variant>_<field>`, constraint `<enum>_variant_check`. Never shorten it for the columns: for `method_*` columns, name the union `Method`. The only exception is when one table stores the same enum twice. Then each copy gets a role prefix ending in the enum name (`refund_payment_method_*`, via `--table 'refund,prefix=refund_payment_method'`). The type stays shared.
 
-The only exception: when one table stores the same enum twice, the columns of each need a distinguishing role prefix that still ends in the enum name, e.g. `original_payment_method_*` and `refund_payment_method_*` (spec field `prefix`). The type stays `payment_method_enum`.
+**The constraint**, per variant: other variants' fields `IS NULL`, own required fields `IS NOT NULL`, `ELSE false` at the end. `ELSE false` matters because a CHECK passes on NULL: a label added later is rejected until the constraint describes its shape. The native enum already rejects unknown labels.
 
-Rules the constraint must follow, per variant:
+**Not flattenable:** a field that is itself a tagged union, or a free-form object. Use a separate table per variant (keyed by the parent id), or keep that value as JSON with `"x-sql": "jsonb"`. If the whole union is rarely queried by field, a single `jsonb` column validated by the application is simpler than this layout. If no variant has fields, a plain native enum column is enough.
 
-- Every field of *other* variants is `IS NULL`.
-- Every required field of *this* variant is `IS NOT NULL`. `Option<T>` fields are left unconstrained.
-- A variant with no conditions uses `THEN true`.
-- Keep `ELSE false`. A CHECK passes when its expression is NULL, so without it a label added later with `ALTER TYPE .. ADD VALUE` would be accepted with arbitrary field values. With it, the new label is rejected until the constraint is updated. The native enum already rejects unknown labels.
-- For `Option<Enum>`, drop `NOT NULL` from the discriminator and prefix the CASE with `(<enum>_variant IS NULL AND <all fields> IS NULL) OR`. Without that branch, `CASE NULL` falls through to `ELSE false`.
+## Tool
 
-Field types and per-field constraints go on the flat column as usual: `REFERENCES`, `CHECK (length(payment_method_card_last4) = 4)`, defaults, and so on. A nullable foreign-key column works as a variant-only foreign key. Keep identifiers within Postgres' 63-character limit; if a name gets too long, shorten the enum's name rather than only the columns.
-
-Generate the DDL rather than hand-writing long constraints:
+`scripts/sql_enum.py` reads the JSON Schema (file or `-`) and prints SQL; `--json` gives machine-readable output. Pick a union with `--def NAME` when the file has several. Pass `--table` once per table that stores the enum.
 
 ```bash
-python3 scripts/generate_enum_sql.py create spec.json      # CREATE TYPE + lines for CREATE TABLE
-python3 scripts/generate_enum_sql.py alter spec.json       # CREATE TYPE + ALTER TABLE .. ADD COLUMN/CONSTRAINT
-python3 scripts/generate_enum_sql.py constraint spec.json  # replace the CHECK after variants change
+python3 scripts/sql_enum.py show payment.schema.json                       # variants, columns, SQL types
+python3 scripts/sql_enum.py setup payment.schema.json --table payment      # CREATE TYPE + columns for CREATE TABLE
+python3 scripts/sql_enum.py setup payment.schema.json --table 'subscription,nullable' --form alter --no-types
+python3 scripts/sql_enum.py modify payment.schema.json --table payment --table 'subscription,nullable' \
+    --add-variant 'paypal={"properties":{"email":{"type":"string"}}}' --write
 ```
 
-```json
-{"table": "payment", "enum": "payment_method", "nullable": false,
- "variants": {"card": {"last4": "text", "network": "text"}, "bank_transfer": {"iban": "text", "bic": "text?"}, "cash": {}}}
-```
+`modify` applies the actions in order, prints the migration(s) and notes, and prints the updated schema (or saves it with `--write`). Actions use labels and property names:
 
-A trailing `?` marks an optional field, and field types are copied verbatim. Set `prefix` only for the same-enum-twice case above.
+| Action | Example |
+| --- | --- |
+| `--add-variant LABEL[=BRANCH]` | `paypal='{"properties":{"email":{"type":"string"}}}'` (properties are required unless they allow null) |
+| `--remove-variant LABEL` | `cash` |
+| `--rename-variant OLD=NEW` | `bank_transfer=sepa` |
+| `--add-field LABEL.FIELD=PROPERTY` | `card.expiry='{"type":"string","x-backfill":"$$12/30$$"}'` |
+| `--remove-field LABEL.FIELD` | `bank_transfer.bic` |
+| `--rename-field LABEL.OLD=NEW` | `card.last4=last_four` |
 
-## Querying
+## Creating
 
-- Filter by variant with `payment_method_variant = 'card'` or `payment_method_variant IN ('card', 'cash')`. Inside such a filter the CHECK guarantees the variant's required fields are non-NULL. With sqlx `query!`, tell it so with `AS "last4!"`.
-- Match with `CASE payment_method_variant WHEN 'card' THEN .. WHEN 'bank_transfer' THEN .. WHEN 'cash' THEN .. END`, listing every label. Postgres does not check exhaustiveness: an unlisted label silently yields NULL. Prefer listing the labels over `ELSE`, so that adding a variant is a search for `<enum>_variant` rather than a silent change.
-- Variant-specific indexes and uniqueness are partial indexes: `CREATE UNIQUE INDEX .. ON payment (payment_method_bank_transfer_iban) WHERE payment_method_variant = 'bank_transfer'`.
-- Never write variant columns one at a time across statements. Set the discriminator and *all* field columns in the same `INSERT`/`UPDATE`, nulling the other variants' fields, or the CHECK rejects the row.
-- Changing a field within the current variant is safe when guarded: `UPDATE .. SET payment_method_card_last4 = $2 WHERE id = $1 AND payment_method_variant = 'card'`.
+1. Write or extend the JSON Schema union. Check it with `show`.
+2. Run `setup`. Put `CREATE TYPE` in the migration once per enum; other tables storing the same enum use `--no-types`.
+3. For a new table, paste the column lines into `CREATE TABLE`. For an existing table, use `--form alter`. On a table that already has rows, add the variant column without `NOT NULL`, fill it, then set `NOT NULL` and add the constraint.
+4. Write the application mapping, e.g. [rust.md](rust.md).
 
-## When this layout is the wrong tool
+## Evolving
 
-- Variants with many fields, their own relations, or heavy per-variant indexing are better as one table per variant keyed by the parent id, with a `(id, variant)` composite foreign key and a native-enum `variant` column on the parent.
-- If the user only needs labels without data (a C-style enum), a plain native ENUM column is enough.
+Always change the schema through `modify` and run what it prints. Every table storing the enum must be passed as `--table`, because they share the type.
 
-## References
+| Change | What the migration does | Watch out |
+| --- | --- | --- |
+| Add variant | Migration 1: `ADD VALUE`. Migration 2: new columns, regenerated constraint. | A new value is unusable, even in a CHECK, until its transaction commits. Keep them as two migration files. Between them, `ELSE false` rejects the new label. |
+| Add field | `ADD COLUMN`, backfill existing rows of that variant, regenerated constraint | A required field needs `"x-backfill": "<SQL expr>"` or must allow null. |
+| Rename variant | `RENAME VALUE`, rename its field columns | The constraint follows renames automatically. |
+| Rename field | `RENAME COLUMN` | |
+| Remove field | `DROP COLUMN`, regenerated constraint | |
+| Remove variant | Guard (fails if rows still use it), drop constraints, swap in a new type, drop its columns, re-add constraints | Postgres cannot drop enum values. Migrate or delete those rows first. Partial indexes, views, functions and defaults on these columns break the swap: drop them before and recreate them after. |
 
-- Rust/sqlx mapping (variant enum, row struct, `TryFrom`, binding parameters): read [references/rust-mapping.md](references/rust-mapping.md) when writing the Rust side.
-- Adding, renaming or removing variants or fields, and migration transaction rules: read [references/evolution.md](references/evolution.md) before writing a migration that changes an existing enum.
+After any label change, update SQL matching on `<enum>_variant` (`CASE`, `WHERE`, partial indexes, views) and the application types. Postgres does not check `CASE` exhaustiveness: an unlisted label yields NULL.
+
+## Querying and writing
+
+- Filter with `payment_method_variant = 'card'`. Inside that filter the variant's required fields are guaranteed non-NULL (sqlx: `AS "last4!"`).
+- Match with `CASE payment_method_variant WHEN 'card' THEN .. WHEN 'bank_transfer' THEN .. WHEN 'cash' THEN .. END`. List every label instead of using `ELSE`, so new variants are found by searching.
+- Variant-specific uniqueness and indexes are partial: `CREATE UNIQUE INDEX .. ON payment (payment_method_bank_transfer_iban) WHERE payment_method_variant = 'bank_transfer'`.
+- Write the variant column and all field columns in the same `INSERT`/`UPDATE`, nulling the other variants' fields. Change a single field only under a guard: `.. WHERE id = $1 AND payment_method_variant = 'card'`.
