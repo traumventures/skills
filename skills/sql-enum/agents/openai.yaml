@@ -1,0 +1,4 @@
+interface:
+  display_name: "SQL Enum"
+  short_description: "Rust-style enums in Postgres with CHECK constraints"
+  default_prompt: "Use $sql-enum to store this Rust enum in a Postgres table."
