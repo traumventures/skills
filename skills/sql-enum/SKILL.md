@@ -56,7 +56,7 @@ Everything is named after the union (`PaymentMethod` -> `payment_method`), and t
 | | JSON Schema | Postgres | Rust |
 | --- | --- | --- | --- |
 | Union | `"title": "PaymentMethod"` | prefix `payment_method` | `enum PaymentMethod` |
-| Discriminator | property `variant`, `const` per branch | column `payment_method` of type `payment_method_variant` | `enum PaymentMethodVariant` |
+| Discriminator | property `variant`, `const` per branch | column `payment_method` of type `payment_method_variant` | `enum PaymentMethodSqlVariant` |
 | Field `last4` of `card` | branch property | column `payment_method_card_last4` | field `last4` / column field `payment_method_card_last4` |
 | Constraint | | `payment_method_check` | |
 
