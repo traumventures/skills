@@ -92,33 +92,64 @@ Per variant: other variants' fields `IS NULL`, own required fields `IS NOT NULL`
 
 ## Nested unions
 
-A field whose schema is itself a tagged union is flattened recursively. Its discriminator becomes a nullable column named after the field, of the nested union's `_variant` type, and its fields continue the prefix. Each level gets its own constraint. The parent's constraint treats the nested column like any other field.
+A field whose schema is itself a tagged union is flattened recursively. Its discriminator becomes a nullable column named after the field, of the nested union's `_variant` type, and its fields continue the prefix. Each level gets its own constraint. The parent's constraint treats the nested column like any other field. In the `cash` branch it only requires `payment_method_card_wallet IS NULL`, and the nested constraint then forces all wallet fields to NULL as well.
 
 ```json
-"Card": {"properties": {"variant": {"const": "card"}, "last4": {"type": "string"},
+{
+  "$defs": {
+    "PaymentMethod": {
+      "title": "PaymentMethod",
+      "oneOf": [
+        {"title": "Card", "type": "object",
+         "properties": {"variant": {"const": "card"}, "last4": {"type": "string"},
                         "wallet": {"anyOf": [{"$ref": "#/$defs/Wallet"}, {"type": "null"}]}},
          "required": ["variant", "last4"]},
-"Wallet": {"title": "Wallet", "oneOf": [
-  {"properties": {"variant": {"const": "apple_pay"}, "device_account": {"type": "string"}}, "required": ["variant", "device_account"]},
-  {"properties": {"variant": {"const": "google_pay"}}, "required": ["variant"]}]}
+        {"title": "Cash", "type": "object",
+         "properties": {"variant": {"const": "cash"}}, "required": ["variant"]}
+      ]
+    },
+    "Wallet": {
+      "title": "Wallet",
+      "oneOf": [
+        {"title": "ApplePay", "type": "object",
+         "properties": {"variant": {"const": "apple_pay"}, "device_account": {"type": "string"}},
+         "required": ["variant", "device_account"]},
+        {"title": "GooglePay", "type": "object",
+         "properties": {"variant": {"const": "google_pay"}}, "required": ["variant"]}
+      ]
+    }
+  }
+}
 ```
+
+The migration, built from `uv run scripts/sql_enum.py setup payment.schema.json --def PaymentMethod --table payment` (it prints the types and the column lines for `CREATE TABLE`):
 
 ```sql
 CREATE TYPE wallet_variant AS ENUM ('apple_pay', 'google_pay');
+CREATE TYPE payment_method_variant AS ENUM ('card', 'cash');
+
+CREATE TABLE payment (
+    id bigint PRIMARY KEY,
     payment_method payment_method_variant NOT NULL,
     payment_method_card_last4 text,
     payment_method_card_wallet wallet_variant,
     payment_method_card_wallet_apple_pay_device_account text,
-    CONSTRAINT payment_method_check CHECK (CASE payment_method
-        WHEN 'card' THEN payment_method_card_last4 IS NOT NULL
-        WHEN 'cash' THEN payment_method_card_last4 IS NULL AND payment_method_card_wallet IS NULL
-        ELSE false END),
+    CONSTRAINT payment_method_check CHECK (
+        CASE payment_method
+            WHEN 'card' THEN payment_method_card_last4 IS NOT NULL
+            WHEN 'cash' THEN payment_method_card_last4 IS NULL AND payment_method_card_wallet IS NULL
+            ELSE false
+        END
+    ),
     CONSTRAINT payment_method_card_wallet_check CHECK (
         (payment_method_card_wallet IS NULL AND payment_method_card_wallet_apple_pay_device_account IS NULL)
         OR CASE payment_method_card_wallet
             WHEN 'apple_pay' THEN payment_method_card_wallet_apple_pay_device_account IS NOT NULL
             WHEN 'google_pay' THEN payment_method_card_wallet_apple_pay_device_account IS NULL
-            ELSE false END)
+            ELSE false
+        END
+    )
+);
 ```
 
 For the Rust side see the nested example in [rust.md](rust.md). Recursive unions (a union that contains itself) cannot be flattened. Neither can a nested union under an array (below).
