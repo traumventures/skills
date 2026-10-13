@@ -1,4 +1,8 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = []
+# ///
 """Store a tagged union described by JSON Schema in Postgres as flat columns.
 
 The JSON Schema is the source of truth. A tagged union is a `oneOf` (or
@@ -13,9 +17,13 @@ The JSON Schema is the source of truth. A tagged union is a `oneOf` (or
       {"title": "Cash", "type": "object",
        "properties": {"variant": {"const": "cash"}}, "required": ["variant"]}]}
 
-Names: type and column `<enum>_variant`, field columns
-`<enum>_<variant>_<field>`, constraint `<enum>_variant_check`; a plain string
-`enum` field gets a type named after its title (`card_network`).
+Names: column `<enum>` of type `<enum>_variant`, field columns
+`<enum>_<variant>_<field>`, constraint `<enum>_check`. A nested union field is
+the column `<enum>_<variant>_<field>` of its own `_variant` type, and its fields
+continue the prefix. A plain string `enum` field gets a type named after its
+title (`card_network`).
+
+Run with `uv run scripts/sql_enum.py ...` (no dependencies) or plain python3.
 
 Commands (SQL on stdout; --json for machine-readable output):
 
@@ -198,6 +206,7 @@ STRING_FORMATS = {
     "uuid": "uuid",
     "ipv4": "inet",
     "ipv6": "inet",
+    "decimal": "numeric",
 }
 INTEGER_FORMATS = {
     "int16": "smallint",
@@ -209,6 +218,25 @@ INTEGER_FORMATS = {
     "uint64": "numeric(20)",
 }
 NUMBER_FORMATS = {"float": "real", "double": "double precision"}
+
+
+def field_union(doc, ps):
+    """(node, title) when a property is itself a tagged union (possibly nullable), else None."""
+    if isinstance(ps, dict) and "x-sql" in ps:
+        return None
+    name = ref_name(ps)
+    p = doc.resolve(ps)
+    if not isinstance(p, dict) or "x-sql" in p:
+        return None
+    for k in ("anyOf", "oneOf"):
+        branches = p.get(k)
+        if isinstance(branches, list):
+            rest = [x for x in branches if doc.resolve(x).get("type") != "null"]
+            if len(rest) == 1 and len(rest) < len(branches):
+                return field_union(doc, rest[0])
+    if discriminator(doc, p):
+        return p, p.get("title") or name
+    return None
 
 
 def column_type(doc, ps, where):
@@ -227,11 +255,6 @@ def column_type(doc, ps, where):
             rest = [x for x in branches if doc.resolve(x).get("type") != "null"]
             if len(rest) == 1 and len(rest) < len(branches):
                 return column_type(doc, rest[0], where)
-    if discriminator(doc, p):
-        fail(
-            f"{where}: a field that is itself a tagged union cannot be flattened; "
-            "store it in its own table, or keep it as JSON with \"x-sql\": \"jsonb\""
-        )
     values = p.get("enum")
     if isinstance(values, list) and len(values) > 1:
         values = [v for v in values if v is not None]
@@ -258,6 +281,12 @@ def column_type(doc, ps, where):
     if t == "boolean":
         return "boolean", None
     if t == "array" and isinstance(p.get("items"), dict):
+        items = doc.resolve(p["items"])
+        if field_union(doc, p["items"]) or (isinstance(items, dict) and items.get("type") == "object"):
+            fail(
+                f"{where}: an array of unions or objects cannot be flattened (one row stores one value); "
+                "use a child table with one row per element, or \"x-sql\": \"jsonb\""
+            )
         sql, enum = column_type(doc, p["items"], where + "[]")
         return sql + "[]", enum
     fail(
@@ -378,20 +407,53 @@ class Table:
                 self.prefix = ident(p[len("prefix="):], "prefix")
             else:
                 fail(f"unknown table option `{p}` (use nullable or prefix=...)")
-        self.vcol = ident(f"{self.prefix}_variant", "column")
-        self.check = ident(f"{self.prefix}_variant_check", "constraint")
+        self.vcol = self.prefix
+        self.check = ident(f"{self.prefix}_check", "constraint")
+
+    @classmethod
+    def nested(cls, name, prefix):
+        return cls(f"{name},nullable,prefix={prefix}", None)
 
     def col(self, v, f):
         return ident(f"{self.prefix}_{v.part}_{f.part}", "column")
 
 
-def columns(e, tb):
-    """(variant, field, column, sql type) for every field column, in order."""
+def sub_enum(e, f, where, seen):
+    """The nested union stored in field `f`, or None."""
+    u = field_union(e.doc, f.schema)
+    if not u:
+        return None
+    sub = build(e.doc, u[0], u[1], None)
+    if sub.name in seen:
+        fail(f"{where}: union `{sub.name}` contains itself; recursive unions cannot be flattened, use a separate table")
+    return sub
+
+
+def columns(e, tb, seen=()):
+    """(variant, field, column, sql type) for every field column of this level, in order.
+    A nested union field is represented by its own variant column."""
     out = []
     for v in e.variants:
         for f in v.fields:
-            sql, _ = column_type(e.doc, f.schema, f"{v.label}.{f.key}")
-            out.append((v, f, tb.col(v, f), sql))
+            where = f"{v.label}.{f.key}"
+            sub = sub_enum(e, f, where, seen + (e.name,))
+            if sub:
+                out.append((v, f, Table.nested(tb.name, tb.col(v, f)).vcol, sub.type))
+            else:
+                sql, _ = column_type(e.doc, f.schema, where)
+                out.append((v, f, tb.col(v, f), sql))
+    return out
+
+
+def levels(e, tb, seen=()):
+    """(enum, table) for this union and every nested union, parents first."""
+    out = [(e, tb)]
+    seen = seen + (e.name,)
+    for v in e.variants:
+        for f in v.fields:
+            sub = sub_enum(e, f, f"{v.label}.{f.key}", seen)
+            if sub:
+                out += levels(sub, Table.nested(tb.name, tb.col(v, f)), seen)
     return out
 
 
@@ -399,19 +461,74 @@ def field_enums(e):
     found = {}
     for v in e.variants:
         for f in v.fields:
+            if field_union(e.doc, f.schema):
+                continue
             _, en = column_type(e.doc, f.schema, f"{v.label}.{f.key}")
             if en:
                 typ, labels = en
-                if typ == e.type:
-                    fail(f"field enum type `{typ}` has the same name as the variant type; retitle it")
                 if typ in found and found[typ] != labels:
                     fail(f"enum type `{typ}` is used with different values")
                 found[typ] = labels
     return found
 
 
+def all_types(e, tb):
+    """Every type the columns need, dependencies first: {name: labels}."""
+    found = {}
+
+    def add(typ, labels):
+        if typ in found and found[typ] != labels:
+            fail(f"type `{typ}` is defined twice with different values; give one of them another title")
+        found[typ] = labels
+
+    for le, _ in reversed(levels(e, tb)):
+        for typ, labels in field_enums(le).items():
+            add(typ, labels)
+        add(le.type, [v.label for v in le.variants])
+    return found
+
+
+def column_map(e, tb, root_id):
+    """{id: (column, sql)} for every column of every level. `root_id(variant, field)`
+    gives the id of a top-level field; nested ids extend it with (label, key)."""
+    out = {("variant",): (tb.vcol, e.type)}
+
+    def walk(e, tb, fid, seen):
+        for v in e.variants:
+            for f in v.fields:
+                i = fid(v, f)
+                sub = sub_enum(e, f, f"{v.label}.{f.key}", seen + (e.name,))
+                if sub:
+                    stb = Table.nested(tb.name, tb.col(v, f))
+                    out[i] = (stb.vcol, sub.type)
+                    walk(sub, stb, lambda sv, sf, i=i: i + (sv.label, sf.key), seen + (e.name,))
+                else:
+                    out[i] = (tb.col(v, f), column_type(e.doc, f.schema, f"{v.label}.{f.key}")[0])
+
+    walk(e, tb, root_id, ())
+    return out
+
+
+def constraints(e, tb):
+    return [(le, ltb) for le, ltb in levels(e, tb) if le.has_fields()]
+
+
 def create_type(typ, labels):
     return f"CREATE TYPE {typ} AS ENUM ({', '.join(q(x) for x in labels)});"
+
+
+def ensure_type(typ, labels):
+    """Create the type unless it exists; fail if an existing one has other values."""
+    arr = "ARRAY[" + ", ".join(q(x) for x in labels) + "]"
+    return (
+        "DO $$\nBEGIN\n"
+        f"    IF to_regtype({q(typ)}) IS NULL THEN\n"
+        f"        {create_type(typ, labels)}\n"
+        f"    ELSIF (SELECT array_agg(enumlabel::text ORDER BY enumsortorder) FROM pg_enum\n"
+        f"           WHERE enumtypid = {q(typ)}::regtype) IS DISTINCT FROM {arr} THEN\n"
+        f"        RAISE EXCEPTION 'type {typ} exists with different values';\n"
+        "    END IF;\nEND $$;"
+    )
 
 
 def check_expr(e, tb, indent):
@@ -441,9 +558,14 @@ def constraint_def(e, tb):
 
 def column_defs(e, tb):
     defs = [f"{tb.vcol} {e.type}{'' if tb.nullable else ' NOT NULL'}"]
-    defs += [f"{col} {sql}" for _, _, col, sql in columns(e, tb)]
-    if e.has_fields():
-        defs.append(constraint_def(e, tb))
+    seen = {tb.vcol}
+    for le, ltb in levels(e, tb):
+        for _, _, col, sql in columns(le, ltb):
+            if col in seen:
+                fail(f"two parts of the union map to the same column `{col}`; rename a variant or field")
+            seen.add(col)
+            defs.append(f"{col} {sql}")
+    defs += [constraint_def(le, ltb) for le, ltb in constraints(e, tb)]
     return defs
 
 
@@ -474,33 +596,37 @@ def tables_of(a, e):
 def cmd_show(a):
     _, _, _, e = load(a)
     tb = Table("t", e.name)
-    out = {
-        "enum": e.name,
-        "type": e.type,
-        "discriminator_property": e.disc,
-        "variant_column": tb.vcol,
-        "variants": [
-            {
-                "label": v.label,
-                "fields": [
-                    {"field": f.key, "column": col, "sql": sql, "required": not f.optional}
-                    for cv, f, col, sql in columns(e, tb)
-                    if cv is v
-                ],
-            }
-            for v in e.variants
-        ],
-        "field_enum_types": field_enums(e),
-    }
+    out = {"enum": e.name, "discriminator_property": e.disc, "levels": []}
+    for le, ltb in levels(e, tb):
+        out["levels"].append({
+            "enum": le.name,
+            "type": le.type,
+            "variant_column": ltb.vcol,
+            "nullable": ltb.nullable,
+            "variants": [
+                {
+                    "label": v.label,
+                    "fields": [
+                        {"field": f.key, "column": col, "sql": sql, "required": not f.optional}
+                        for cv, f, col, sql in columns(le, ltb)
+                        if cv is v
+                    ],
+                }
+                for v in le.variants
+            ],
+        })
+    out["types"] = all_types(e, tb)
     if a.json:
         return out
-    lines = [f"enum {e.name}: type {e.type}, column {tb.vcol} (JSON property `{e.disc}`)"]
-    for v in out["variants"]:
-        lines.append(f"  {v['label']}")
-        for f in v["fields"]:
-            lines.append(f"    {f['column']:<40} {f['sql']:<24} {'required' if f['required'] else 'optional'}")
-    for typ, labels in out["field_enum_types"].items():
-        lines.append(f"field enum type {typ}: {', '.join(labels)}")
+    lines = []
+    for lvl in out["levels"]:
+        nested = " (nested, nullable)" if lvl["nullable"] else f" (JSON property `{e.disc}`)"
+        lines.append(f"enum {lvl['enum']}: type {lvl['type']}, column {lvl['variant_column']}{nested}")
+        for v in lvl["variants"]:
+            lines.append(f"  {v['label']}")
+            for f in v["fields"]:
+                lines.append(f"    {f['column']:<44} {f['sql']:<24} {'required' if f['required'] else 'optional'}")
+    lines.append("types: " + ", ".join(f"{t} ({', '.join(l)})" for t, l in out["types"].items()))
     return "\n".join(lines) + "\n"
 
 
@@ -509,11 +635,10 @@ def cmd_setup(a):
     tables = tables_of(a, e)
     parts, notes = [], []
     if not a.no_types:
-        for typ, labels in field_enums(e).items():
-            parts.append(f"-- Field enum type; skip if it already exists.\n{create_type(typ, labels)}")
+        types = all_types(e, Table(tables[0].name, e.name))
         parts.append(
-            f"-- Shared by every table that stores {e.name}; skip if it already exists.\n"
-            f"{create_type(e.type, [v.label for v in e.variants])}"
+            "-- Types are shared by every table that uses them: created once, checked otherwise.\n"
+            + "\n".join(ensure_type(t, labels) for t, labels in types.items())
         )
     for tb in tables:
         defs = column_defs(e, tb)
@@ -688,7 +813,7 @@ def cmd_modify(a):
         apply_action(doc, node, title, a.name, kind, arg, tr, notes)
     new = build(doc, node, title, a.name)
     for tb in tables:
-        columns(new, tb)  # validates every field type and column name
+        column_defs(new, tb)  # validates every field type and column name
 
     old_v = dict(enumerate(old.variants))
     new_v = {t["id"]: new.variant(t["label"]) for t in tr.variants}
@@ -698,34 +823,33 @@ def cmd_modify(a):
     renamed = [(o.label, n.label) for o, n, _ in kept if o.label != n.label]
     swap = bool(removed)
 
-    # Field-level changes (variant objects from old/new models).
-    field_renames, field_drops, field_adds = [], [], []
-    for v in removed:
-        field_drops += [(v, f) for f in v.fields]
-    for t in added:
-        nv = new_v[t["id"]]
-        field_adds += [(nv, f, None) for f in nv.fields]
-    for o, n, t in kept:
-        live = {x["id"]: x["key"] for x in t["fields"]}
-        for of in o.fields:
-            fid = (t["id"], of.key)
-            if fid in live:
-                field_renames.append((o, of, n, n.field(live[fid])))
-            else:
-                field_drops.append((o, of))
-        for fid, key in live.items():
-            if fid[0] == "new":
-                nf = n.field(key)
-                backfill = tr.backfill.get(fid)
-                if not nf.optional and backfill is None:
-                    fail(
-                        f"`{n.label}.{key}` is required, so existing `{n.label}` rows need a value: add "
-                        f"\"x-backfill\": \"<SQL expression>\" to the property, or allow null"
-                    )
-                field_adds.append((n, nf, backfill))
-    shape_changed = swap or bool(added) or bool(field_drops) or bool(field_adds)
-    if not (shape_changed or renamed or any(o.part != n.part or of.part != nf.part for o, of, n, nf in field_renames)):
+    # New required fields of existing variants need a value for existing rows.
+    for _, n, t in kept:
+        for x in t["fields"]:
+            if x["id"][0] == "new" and not n.field(x["key"]).optional and x["id"] not in tr.backfill:
+                fail(
+                    f"`{n.label}.{x['key']}` is required, so existing `{n.label}` rows need a value: add "
+                    f"\"x-backfill\": \"<SQL expression>\" to the property, or allow null"
+                )
+
+    # Column-level diff over every nesting level, keyed by stable field ids.
+    old_index = {id(v): i for i, v in enumerate(old.variants)}
+    new_ids = {(t["label"], x["key"]): x["id"] for t in tr.variants for x in t["fields"]}
+    labels_by_id = {x["id"]: t["label"] for t in tr.variants for x in t["fields"]}
+    plans = []
+    for tb in tables:
+        oc = column_map(old, tb, lambda v, f: (old_index[id(v)], f.key))
+        nc = column_map(new, tb, lambda v, f: new_ids[(v.label, f.key)])
+        plans.append((
+            tb,
+            [oc[k][0] for k in oc if k not in nc],
+            [(oc[k][0], nc[k][0]) for k in nc if k in oc and oc[k][0] != nc[k][0]],
+            [(k, nc[k][0], nc[k][1]) for k in nc if k not in oc],
+        ))
+    columns_changed = any(d or r or ad for _, d, r, ad in plans)
+    if not (swap or added or columns_changed or renamed):
         fail("the actions do not change the database")
+    rebuild_checks = swap or bool(added) or columns_changed
 
     first, body = [], []
     rename_values = [f"ALTER TYPE {old.type} RENAME VALUE {q(x)} TO {q(y)};" for x, y in renamed]
@@ -748,12 +872,13 @@ def cmd_modify(a):
                 f"        RAISE EXCEPTION '{tb.name} still has {tb.vcol} rows in ({labels}); migrate or delete them first';\n"
                 "    END IF;\nEND $$;"
             )
-    old_enum_types = set(field_enums(old))
-    for typ, labels in field_enums(new).items():
-        if typ not in old_enum_types:
-            body.append(f"-- New field enum type; skip if it already exists.\n{create_type(typ, labels)}")
-    if shape_changed:
-        body += [f"ALTER TABLE {tb.name} DROP CONSTRAINT IF EXISTS {tb.check};" for tb in tables]
+    old_types = all_types(old, tables[0])
+    for typ, labels in all_types(new, tables[0]).items():
+        if typ not in old_types:
+            body.append(ensure_type(typ, labels))
+    if rebuild_checks:
+        for tb in tables:
+            body += [f"ALTER TABLE {tb.name} DROP CONSTRAINT IF EXISTS {ltb.check};" for _, ltb in constraints(old, tb)]
     if swap:
         tmp = ident(f"{old.type}_new", "enum type")
         body.append(create_type(tmp, [v.label for v in new.variants]))
@@ -762,21 +887,17 @@ def cmd_modify(a):
                 f"ALTER TABLE {tb.name} ALTER COLUMN {tb.vcol} TYPE {tmp} USING {tb.vcol}::text::{tmp};"
             )
         body += [f"DROP TYPE {old.type};", f"ALTER TYPE {tmp} RENAME TO {old.type};"]
-    for tb in tables:
-        for o, of, n, nf in field_renames:
-            if tb.col(o, of) != tb.col(n, nf):
-                body.append(f"ALTER TABLE {tb.name} RENAME COLUMN {tb.col(o, of)} TO {tb.col(n, nf)};")
-        for v, f in field_drops:
-            body.append(f"ALTER TABLE {tb.name} DROP COLUMN {tb.col(v, f)};")
-        for v, f, _ in field_adds:
-            sql, _ = column_type(doc, f.schema, f"{v.label}.{f.key}")
-            body.append(f"ALTER TABLE {tb.name} ADD COLUMN {tb.col(v, f)} {sql};")
-        for v, f, backfill in field_adds:
-            if backfill is not None:
-                body.append(f"UPDATE {tb.name} SET {tb.col(v, f)} = {backfill} WHERE {tb.vcol} = {q(v.label)};")
-    if shape_changed and new.has_fields():
+    for tb, drops, renames, adds in plans:
+        body += [f"ALTER TABLE {tb.name} DROP COLUMN {c};" for c in drops]
+        body += [f"ALTER TABLE {tb.name} RENAME COLUMN {o} TO {n};" for o, n in renames]
+        body += [f"ALTER TABLE {tb.name} ADD COLUMN {c} {sql};" for _, c, sql in adds]
+        for k, c, _ in adds:
+            if k in tr.backfill:
+                body.append(f"UPDATE {tb.name} SET {c} = {tr.backfill[k]} WHERE {tb.vcol} = {q(labels_by_id[k])};")
+    if rebuild_checks:
         for tb in tables:
-            body += add_constraint(new, tb)
+            for le, ltb in constraints(new, tb):
+                body += add_constraint(le, ltb)
 
     migrations = []
     if first:
